@@ -316,7 +316,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, setDoc, getDoc, updateDoc, increment } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, doc, setDoc, updateDoc, increment, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
         
         // --- NEW: Custom Color Map (Resolves ReferenceError) ---
         const CUSTOM_COLORS = {
@@ -360,11 +360,16 @@
         async function initializeFirebase() {
             try {
                 // --- Set immediate loading state ---
-                document.getElementById('count-value').textContent = "Loading...";
-                document.getElementById('result-count-value').textContent = "Loading...";
+                document.getElementById('count-value').textContent = "Connecting...";
+                document.getElementById('result-count-value').textContent = "Connecting...";
 
+                // Check and parse config
                 firebaseConfig = JSON.parse(__firebase_config);
                 appId = __app_id;
+
+                if (!firebaseConfig || Object.keys(firebaseConfig).length === 0) {
+                    throw new Error("Firebase configuration is empty. Ensure setup is complete.");
+                }
                 
                 const app = initializeApp(firebaseConfig);
                 db = getFirestore(app);
@@ -376,72 +381,73 @@
                     await signInAnonymously(auth);
                 }
                 
-                await updateVisitorCount();
-                await getAndDisplayDailyUses();
+                // --- Use onSnapshot for real-time reliable data flow ---
+                setupVisitorCountListener();
+                setupDailyUsesListener();
+                
+                // Immediately attempt to increment the visitor count
+                await attemptIncrementVisitorCount();
 
             } catch (error) {
-                console.error("Firebase initialization failed:", error);
-                // --- CLEAR ERROR FEEDBACK ON FAILURE ---
+                console.error("Critical Firebase initialization error. Check console for details.", error);
                 document.getElementById('count-value').textContent = "Error";
                 document.getElementById('result-count-value').textContent = "Error";
             }
         }
+        
+        function setupVisitorCountListener() {
+            if (!db) return;
+            const counterRef = doc(db, COUNTER_PATH);
+            
+            onSnapshot(counterRef, (docSnap) => {
+                let currentCount = 0;
+                if (docSnap.exists()) {
+                    currentCount = docSnap.data().count || 0;
+                }
+                document.getElementById('count-value').textContent = currentCount.toLocaleString();
+            }, (error) => {
+                console.error("Error setting up visitor count listener. Check Rules/Path!", error);
+                document.getElementById('count-value').textContent = "Error";
+            });
+        }
 
-        async function updateVisitorCount() {
+        async function attemptIncrementVisitorCount() {
             if (!db || !auth) return;
 
             const counterRef = doc(db, COUNTER_PATH);
             const isCounted = sessionStorage.getItem(VISITOR_SESSION_KEY);
-            let shouldIncrement = !isCounted;
-            let currentCount = 0;
 
-            if (shouldIncrement) {
+            if (!isCounted) {
                 try {
+                    // Attempt to increment the counter
                     await updateDoc(counterRef, { count: increment(1) });
                     sessionStorage.setItem(VISITOR_SESSION_KEY, 'true');
                 } catch (e) {
                     if (e.code === 'not-found') {
                          try {
+                            // If document doesn't exist, create it with count = 1
                             await setDoc(counterRef, { count: 1 });
                             sessionStorage.setItem(VISITOR_SESSION_KEY, 'true');
                          } catch (e2) {
                             console.error("Error setting initial visitor count:", e2);
-                            shouldIncrement = false;
                          }
+                    } else if (e.code === 'permission-denied') {
+                         console.error("Permission Denied for visitor increment. FIX FIREBASE RULES!");
                     } else {
                         console.error("Error incrementing visitor count:", e);
-                        shouldIncrement = false;
                     }
                 }
             }
-
-            try {
-                const docSnap = await getDoc(counterRef);
-                if (docSnap.exists()) {
-                    currentCount = docSnap.data().count || 0;
-                } else if (shouldIncrement) {
-                    currentCount = 1;
-                }
-
-                document.getElementById('count-value').textContent = currentCount.toLocaleString();
-
-            } catch (error) {
-                console.error("Error fetching visitor count (Check Rules/Path!):", error);
-                document.getElementById('count-value').textContent = "---";
-            }
         }
         
-        async function getAndDisplayDailyUses() {
-            if (!db || !auth) return;
-            
+        function setupDailyUsesListener() {
+            if (!db) return;
             const istDate = getISTDateString();
             const dailyPath = `/artifacts/${appId}/public/data/rfx_daily_analytics/${istDate}`;
             const dailyRef = doc(db, dailyPath);
-            
-            try {
-                const docSnap = await getDoc(dailyRef);
+
+            onSnapshot(dailyRef, (docSnap) => {
                 let currentCount = 0;
-                
                 if (docSnap.exists()) {
                     const data = docSnap.data();
                     currentCount = (data.rfi_count || 0) + 
@@ -449,13 +455,11 @@
                                    (data.rfq_count || 0) + 
                                    (data.rfs_count || 0);
                 }
-                
                 document.getElementById('result-count-value').textContent = currentCount.toLocaleString();
-
-            } catch (error) {
-                console.error("Error fetching daily uses count (Check Rules/Path!):", error);
-                document.getElementById('result-count-value').textContent = "---";
-            }
+            }, (error) => {
+                 console.error("Error setting up daily uses listener. Check Rules/Path!", error);
+                 document.getElementById('result-count-value').textContent = "Error";
+            });
         }
 
         async function trackRFxResult(result) {
@@ -473,15 +477,19 @@
 
             if (fieldToIncrement) {
                 try {
+                    // Attempt to update the daily count
                     await updateDoc(dailyRef, { [fieldToIncrement]: increment(1) });
                 } catch (e) {
                     if (e.code === 'not-found') {
+                        // If document doesn't exist, create it with the first count
                         await setDoc(dailyRef, { date: istDate, unique_visits: 0, rfi_count: 0, rfp_count: 0, rfq_count: 0, rfs_count: 0, [fieldToIncrement]: 1 });
+                    } else if (e.code === 'permission-denied') {
+                         console.error("Permission Denied for result tracking. FIX FIREBASE RULES!");
+                    } else {
+                         console.error("Error tracking RFx result:", e);
                     }
                 }
             }
-            
-            await getAndDisplayDailyUses();
         }
 
         // --- CORE RFX LOGIC ---
@@ -541,7 +549,7 @@
             // Apply selected button style
             buttonElement.classList.add('selected');
             buttonElement.style.transform = 'translateY(1px)'; 
-            buttonElement.style.boxShadow = '0 2px 4px rgba(0, 0, 0, 0.2)';
+            buttonElement.style.boxShadow = '0 2px 4px rgba(0, 0, 0, 0.3)';
             buttonElement.style.background = getTailwindColor('procure-blue'); 
             buttonElement.style.color = 'white'; 
             
@@ -741,6 +749,7 @@
             resetTool(); 
         });
 
+        // --- EXPOSE FUNCTIONS GLOBALLY FOR HTML ONCLICK ---
         window.setAnswer = setAnswer;
         window.resetTool = resetTool;
     </script>
